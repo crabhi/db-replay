@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "db-replay"
+version = "0.1.0"
+description = ""
+authors = ["Filip Sedlák <filip@sedlakovi.org>"]
+
+[tool.poetry.dependencies]
+python = "^3.9"
+aiopg = "^1.3.3"
+aiosqlite = "^0.17.0"
+click = "^8.1.2"
+aiofiles = "^0.8.0"
+
+[tool.poetry.dev-dependencies]
+pytest = "^5.2"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
