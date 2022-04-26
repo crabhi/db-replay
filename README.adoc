@@ -1,4 +1,16 @@
 = PostgreSQL DB replay
+ifdef::env-github[]
+:imagesdir:
+ https://gist.githubusercontent.com/path/to/gist/revision/dir/with/all/images
+:tip-caption: :bulb:
+:note-caption: :information_source:
+:important-caption: :heavy_exclamation_mark:
+:caution-caption: :fire:
+:warning-caption: :warning:
+endif::[]
+ifndef::env-github[]
+:imagesdir: ./
+endif::[]
 
 This tool allows to take a log of PostgreSQL queries and simulate the traffic
 at a different database.
@@ -13,9 +25,9 @@ The result is a file `replay.sqlite` that contains references to the queries
 == Usage
 
 1. Log all queries. This tool has been tested with the following configuration:
-
-[source,config]
----
++
+[source,ruby]
+----
 log_min_duration_statement = '0'        # -1 is disabled, 0 logs all statements
                                         # and their durations, > 0 logs only
                                         # statements running at least this number
@@ -42,12 +54,12 @@ log_line_prefix = '%m [%p] %c %q%u@%d %x '            # special values:
                                         #        processes
                                         #   %% = '%'
                                         # e.g. '<%u%%%d> '
----
+----
 
 2. Run it:
-
++
 [source,bash]
----
+----
 # Tell where to connect
 export PGHOST=...
 export PGUSER=...
@@ -58,4 +70,4 @@ poetry shell
 
 # Optionally, use --time-factor to slow down or speed up the queries.
 python db_replay/replay.py --time-factor 0.02  postgresql-13-main-20220423.log postgresql-13-main-20220424.log
----
+----
