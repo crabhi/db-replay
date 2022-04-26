@@ -3,17 +3,19 @@ import io
 import itertools
 import re
 import sqlite3
+import sys
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from queue import Queue
-from re import Match
 from threading import Thread
-from typing import Dict, List
 
 import click
 import dateutil.parser
 import psycopg2.pool
+from psycopg2 import DatabaseError
+from psycopg2.errors import UniqueViolation, ForeignKeyViolation
 
 
 @dataclasses.dataclass
@@ -25,6 +27,8 @@ class Query:
     original_time_ms: float
     process_start: float
     timestamp: datetime
+    failure_msg: str = None
+    last_line: int = None
     my_time_ms: float = None
     seq: int = None
     sql: str = None
@@ -35,14 +39,26 @@ class Waiter:
         self.first_query = first_query
         self.time_factor = time_factor
         self.real_start_time = datetime.now(timezone.utc)
+        self.last_reported = self.real_start_time
+        self.counter = 0
 
     def wait_for_query(self, query_time: datetime):
         query_offset = query_time - self.first_query
-        real_offset = datetime.now(timezone.utc) - self.real_start_time
-
+        now = datetime.now(timezone.utc)
+        real_offset_s = (now - self.real_start_time).total_seconds()
         wanted_offset_s = query_offset.total_seconds() / self.time_factor
-        sleep_duration = wanted_offset_s - real_offset.total_seconds()
+        self.counter += 1
+
+        if now - self.last_reported > timedelta(seconds=5):
+            self.last_reported = now
+            if real_offset_s - wanted_offset_s > 4:
+                click.echo(f'LAGGING! Wanted offset (s)/ Real offset (s): {wanted_offset_s:.0f} / {real_offset_s:.0f}')
+            click.echo(f'Processed: {self.counter: 6d} queries in {now - self.real_start_time}')
+
+        sleep_duration = wanted_offset_s - real_offset_s
         if sleep_duration > 0:
+            if sleep_duration > 0.5:
+                click.echo(f'Waiting for {sleep_duration:4.1f}s')
             time.sleep(sleep_duration)
 
 
@@ -55,12 +71,11 @@ PROGRESS_REPORT_QUEUE = Queue(maxsize=0)
 
 
 @click.command()
-@click.option('--start-txid', default=None, help='Start at transaction')
 @click.option('--time-factor', default=1.0, help='Run faster or slower than production')
 @click.option('--progress-db', default='replay.sqlite', help='Where to store progress data')
 @click.option('--allow-unsorted-files')
 @click.argument('files', nargs=-1)
-def replay(start_txid, time_factor, progress_db, allow_unsorted_files, files):
+def replay(time_factor, progress_db, allow_unsorted_files, files):
     if list(sorted(files)) != list(files) and not allow_unsorted_files:
         click.echo(files)
         raise ValueError('The log files are not sorted. If you are sure the order is correct, '
@@ -68,16 +83,14 @@ def replay(start_txid, time_factor, progress_db, allow_unsorted_files, files):
 
     with sqlite3.connect(progress_db) as db:
         prepare_local_db(db)
-        if not start_txid:
-            start_txid = get_last_txid(db) + 1
-        else:
-            start_txid = int(start_txid)
+        last_pos = get_position(db)
 
     target_pool = psycopg2.pool.ThreadedConnectionPool(0, 200)
 
-    queries = parse_files(files, start_txid)
+    queries = parse_files(files, last_pos)
     # Peek to find the time of the first query
     first_query = next(queries)
+    click.echo(f'Starting at {first_query.file}:{first_query.line}')
     queries = itertools.chain([first_query], queries)
 
     waiter = Waiter(time_factor, first_query.timestamp)
@@ -86,6 +99,7 @@ def replay(start_txid, time_factor, progress_db, allow_unsorted_files, files):
 
     # Simulate multiple workers querying the database. Each session (PostgreSQL process) is a single thread.
     tasks = {}
+
     for query in queries:
         existing = tasks.get(query.process_id)
 
@@ -94,18 +108,22 @@ def replay(start_txid, time_factor, progress_db, allow_unsorted_files, files):
             existing = None
 
         if existing:
-            task, q, process_start = existing
-            if task.done():
-                task.exception()
+            task, queue, process_start = existing
         else:
-            q = Queue()
-            task = EXECUTOR.submit(session_task, q, PROGRESS_REPORT_QUEUE, target_pool, waiter)
-            tasks[query.process_id] = (task, q, query.process_start)
+            queue = Queue(maxsize=10)
+            task = EXECUTOR.submit(
+                session_task,
+                queue,
+                PROGRESS_REPORT_QUEUE,
+                target_pool,
+                waiter,
+                f'{query.process_start:X}.{query.process_id:X}'.lower())
+            tasks[query.process_id] = (task, queue, query.process_start)
 
-        q.put(query)
+        queue.put(query)
 
-    for task, q, _ in tasks.values():
-        q.put(POISON_PILL)
+    for task, queue, _ in tasks.values():
+        queue.put(POISON_PILL)
         task.result()
 
     while not PROGRESS_REPORT_QUEUE.empty():
@@ -115,35 +133,17 @@ def replay(start_txid, time_factor, progress_db, allow_unsorted_files, files):
     progress_reporter.setDaemon(True)
 
 
-def parse_files(filenames, start_txid):
-    transactions: Dict[int, List[Query]] = {}
+def parse_files(filenames, last_pos):
+    """Return consecutive log records from files, optionally skipping """
+    if last_pos:
+        filenames = itertools.dropwhile(lambda x: x != last_pos[0], filenames)
 
-    lines_iterator = (query for filename in filenames for query in parse_lines(filename))
-
-    # Skip lines until we see txid
-    for query in lines_iterator:
-        if query.txid >= start_txid:
-            transactions.setdefault(query.process_id, []).append(query)
-            click.echo(click.style(f'Found transaction {t[-1].txid}', fg='green', bold=True))
-            break
-
-        t = transactions.setdefault(query.process_id, [])
-
-        if t and query.sql == 'COMMIT' and query.txid == 0:
-            # Discard old transactions
-            transactions[query.process_id] = []
-        if not t or query.txid == 0 or t[-1].txid == 0 or query.txid == t[-1].txid:
-            t.append(query)
-        else:
-            transactions[query.process_id] = [query]
-
-    for ts in transactions.values():
-        yield from ts
-
-    yield from lines_iterator
+    for filename in filenames:
+        start_line = last_pos[1] + 1 if last_pos and filename == last_pos[0] else None
+        yield from parse_lines(filename, start_line)
 
 
-def parse_lines(filename) -> [Query]:
+def parse_lines(filename, start_line) -> [Query]:
     query = None
     buffer = None
     last_txid = 0
@@ -151,9 +151,13 @@ def parse_lines(filename) -> [Query]:
     with open(filename) as f:
         for lineno, line in enumerate(f, start=1):
             if lineno % 1000 == 0: print(lineno, last_txid)
+            if start_line and lineno < start_line:
+                continue
+
             if not line.startswith('\t'):
                 if query:
                     query.sql = buffer.getvalue()
+                    query.last_line = lineno - 1
                     yield query
                     buffer = None
                     query = None
@@ -171,10 +175,12 @@ def parse_lines(filename) -> [Query]:
                         )
                         if query.txid:
                             last_txid = query.txid
-                        buffer = io.StringIO(query_match.group('sql'))
+                        buffer = io.StringIO()
+                        buffer.write(query_match.group('sql'))
                         continue
             elif buffer:
-                buffer.write(line[1:])
+                buffer.write("' || E'\\n' || '")
+                buffer.write(line[1:-1])
                 continue
 
             if not RE_EXCLUDE.search(line):
@@ -187,65 +193,98 @@ class ProgressReporter(Thread):
         self.progress_dbname = progress_dbname
 
     def run(self):
+        current_filename = None
+        current_file_id = None
         with sqlite3.connect(self.progress_dbname) as progress_db:
             while True:
-                query: Query = PROGRESS_REPORT_QUEUE.get()
+                q: Query = PROGRESS_REPORT_QUEUE.get()
+
+                if q.file != current_filename:
+                    if current_filename is not None:
+                        click.echo(f'Switching file to {q.file}')
+                    c = progress_db.cursor()
+                    c.execute('SELECT id FROM files WHERE filename = ?', (q.file,))
+                    row = c.fetchone()
+                    if row:
+                        current_file_id = row[0]
+                    else:
+                        c.execute('INSERT INTO files (filename) VALUES (?)', (q.file,))
+                        current_file_id = c.lastrowid
+                    current_filename = q.file
+
                 progress_db.execute('''
-                INSERT INTO queries (txid, file, line, original_time_ms, my_time_ms)
-                VALUES (%s, %s, %s, %s, %s)
-                ''', [query.txid, query.file, query.line, query.original_time_ms, query.my_time_ms])
+                INSERT INTO queries (txid, file, line_from, line_to, original_time_ms, my_time_ms, failure_message)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', [q.txid, current_file_id, q.line, q.last_line, q.original_time_ms, q.my_time_ms, q.failure_msg])
+                progress_db.commit()
 
 
-def session_task(queue: Queue, progress_queue: Queue, target_pool, waiter):
-    target_db = target_pool.getconn()
+def session_task(queue: Queue, progress_queue: Queue, target_pool, waiter, session_id):
+    print(f'Starting thread {session_id}')
     try:
-        query: Query = queue.get()
-        if query is POISON_PILL:
-            click.echo('Finishing')
-            return
+        target_db = target_pool.getconn()
+    except DatabaseError:
+        traceback.print_exc()
+        sys.exit(1)
 
-        waiter.wait_for_query(query.timestamp)
+    try:
+        cursor = target_db.cursor()
+        while True:
+            query: Query = queue.get()
+            if query is POISON_PILL:
+                click.echo(f'Finishing {session_id}')
+                cursor.close()
+                return
 
-        start_time = time.monotonic()
-        try:
-            target_db.execute(query.sql)
-        except Exception as e:
-            print(e)
-        end_time = time.monotonic()
-        print('.')
+            cursor.execute('SET statement_timeout = %s', (query.original_time_ms * 10 + 5,))
+            waiter.wait_for_query(query.timestamp)
 
-        query.my_time_ms = (end_time - start_time) * 1000
-        progress_queue.put(query)
-    except Exception as e:
-        print(e)
-        raise
+            start_time = time.monotonic()
+            try:
+                cursor.execute(query.sql)
+            except Exception as e:
+                if not isinstance(e, (UniqueViolation, ForeignKeyViolation)):
+                    traceback.print_exc()
+                query.failure_msg = str(e)
+                target_db.rollback()
+            end_time = time.monotonic()
+
+            query.my_time_ms = (end_time - start_time) * 1000
+            progress_queue.put(query)
+    except Exception:
+        traceback.print_exc()
+        sys.exit(1)
     finally:
         print('Finishing connection')
         target_pool.putconn(target_db)
 
 
 def prepare_local_db(progress_db):
-    progress_db.execute('''
+    progress_db.executescript('''
+    CREATE TABLE IF NOT EXISTS files (
+        id INTEGER PRIMARY KEY,
+        filename VARCHAR NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS filename_unique ON files(filename);
     CREATE TABLE IF NOT EXISTS queries (
+        id INTEGER PRIMARY KEY,
         txid VARCHAR NOT NULL,
-        file VARCHAR NOT NULL,
-        line INT NOT NULL,
+        file INTEGER NOT NULL,
+        line_from INT NOT NULL,
+        line_to INT NOT NULL,
         original_time_ms FLOAT NOT NULL,
         my_time_ms FLOAT NOT NULL,
-        failure_message TEXT
+        failure_message TEXT,
+        FOREIGN KEY (file) REFERENCES files (id)
     );
     ''')
-    progress_db.execute('CREATE INDEX IF NOT EXISTS queries_txid ON queries (txid) WHERE txid > 0')
 
 
-def get_last_txid(progress_db):
+def get_position(progress_db):
     c = progress_db.cursor()
-    c.execute('SELECT MAX(txid) FROM queries WHERE txid > 0')
-    max_txid, = c.fetchone()
-
-    if not max_txid:
-        raise ValueError('No transaction ID remembered. Can\'t continue. Specify --start-txid')
-    return max_txid
+    c.execute('SELECT filename, line_to FROM queries JOIN files ON file = files.id ORDER BY queries.id DESC LIMIT 1')
+    pos = c.fetchone()
+    return pos
 
 
 if __name__ == '__main__':
