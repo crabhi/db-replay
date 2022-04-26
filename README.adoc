@@ -71,3 +71,34 @@ poetry shell
 # Optionally, use --time-factor to slow down or speed up the queries.
 python db_replay/replay.py --time-factor 0.02  postgresql-13-main-20220423.log postgresql-13-main-20220424.log
 ----
+
+== Example
+
+[source,sql]
+----
+$ sqlite3 replay.sqlite
+SQLite version 3.35.5 2021-04-19 18:32:05
+Enter ".help" for usage hints.
+sqlite> .schema
+CREATE TABLE files (
+        id INTEGER PRIMARY KEY,
+        filename VARCHAR NOT NULL
+    );
+CREATE UNIQUE INDEX filename_unique ON files(filename);
+CREATE TABLE queries (
+        id INTEGER PRIMARY KEY,
+        txid VARCHAR NOT NULL,
+        file INTEGER NOT NULL,
+        line_from INT NOT NULL,
+        line_to INT NOT NULL,
+        original_time_ms FLOAT NOT NULL,
+        my_time_ms FLOAT NOT NULL,
+        failure_message TEXT,
+        FOREIGN KEY (file) REFERENCES files (id)
+    );
+sqlite> SELECT line_from, original_time_ms, my_time_ms, failure_message FROM queries LIMIT 5;
+1|0.165|88.8778469998215|
+2|0.131|35.6218519991671|
+3|0.017|38.4654190020228|
+4|0.195|75.7351760003075|
+----
