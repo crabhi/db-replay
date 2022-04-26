@@ -137,55 +137,56 @@ def _replay(time_factor, progress_db, allow_unsorted_files, files):
     # Instead, put them into a queue and wait when there are a few tasks in the queue.
     finishing_tasks = Queue()
 
-    for query in queries:
-        if query.process_id in transactions:
-            task, queue = transactions.get(query.process_id)
-            queue.put(query)
-            if query.sql in ['COMMIT', 'ROLLBACK']:
-                queue.put(POISON_PILL)
-                # This kind of task finishes when it depletes the queue.
-                finishing_tasks.put(task)
-                del transactions[query.process_id]
-        elif query.sql == 'BEGIN':
-            queue = Queue()
-            task = EXECUTOR.submit(
-                session_task,
-                queue,
-                progress_reporter_q,
-                target_pool,
-                waiter,
-                f'{query.process_start:X}.{query.process_id:X}'.lower())
-            transactions[query.process_id] = (task, queue)
-        else:
-            independent_query_queue.put(query)
+    try:
+        for query in queries:
+            if query.process_id in transactions:
+                task, queue = transactions.get(query.process_id)
+                queue.put(query)
+                if query.sql in ['COMMIT', 'ROLLBACK']:
+                    queue.put(POISON_PILL)
+                    # This kind of task finishes when it depletes the queue.
+                    finishing_tasks.put(task)
+                    del transactions[query.process_id]
+            elif query.sql == 'BEGIN':
+                queue = Queue()
+                task = EXECUTOR.submit(
+                    session_task,
+                    queue,
+                    progress_reporter_q,
+                    target_pool,
+                    waiter,
+                    f'{query.process_start:X}.{query.process_id:X}'.lower())
+                transactions[query.process_id] = (task, queue)
+            else:
+                independent_query_queue.put(query)
 
-        if finishing_tasks.qsize() > 100:
+            if finishing_tasks.qsize() > 100:
+                finishing_tasks.get().result()
+    finally:
+        print('Waiting for queries to finish')
+        # Wait for transaction tasks that we know should finish
+        while not finishing_tasks.empty():
             finishing_tasks.get().result()
 
-    print('Waiting for queries to finish')
-    # Wait for transaction tasks that we know should finish
-    while not finishing_tasks.empty():
-        finishing_tasks.get().result()
+        if transactions:
+            click.echo(f'There are {len(transactions)} unfinished transactions that will be rolled back.')
+        for task, queue in transactions.values():
+            queue.put(POISON_PILL)
+            task.result()
 
-    if transactions:
-        click.echo(f'There are {len(transactions)} unfinished transactions that will be rolled back.')
-    for task, queue in transactions.values():
-        queue.put(POISON_PILL)
-        task.result()
+        # Wait until all the independent queries have been processed by the tasks.
+        independent_query_queue.join()
 
-    # Wait until all the independent queries have been processed by the tasks.
-    independent_query_queue.join()
+        # Now, just send signal to the workers that we're done.
+        for i in range(len(independent_query_executors)):
+            independent_query_queue.put(POISON_PILL)
 
-    # Now, just send signal to the workers that we're done.
-    for i in range(len(independent_query_executors)):
-        independent_query_queue.put(POISON_PILL)
+        # And collect their exceptions if any.
+        for task in independent_query_executors:
+            task.result()
 
-    # And collect their exceptions if any.
-    for task in independent_query_executors:
-        task.result()
-
-    # Once nobody is sending queries, wait for all to be safely reported.
-    progress_reporter_q.join()
+        # Once nobody is sending queries, wait for all to be safely reported.
+        progress_reporter_q.join()
 
 
 def parse_files(filenames, last_pos):
