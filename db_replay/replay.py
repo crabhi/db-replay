@@ -1,3 +1,4 @@
+import contextlib
 import dataclasses
 import io
 import itertools
@@ -15,7 +16,7 @@ import click
 import dateutil.parser
 import psycopg2.pool
 from psycopg2 import DatabaseError
-from psycopg2.errors import UniqueViolation, ForeignKeyViolation
+from psycopg2.errors import UniqueViolation, ForeignKeyViolation, InvalidCursorName
 
 
 @dataclasses.dataclass
@@ -30,7 +31,6 @@ class Query:
     failure_msg: str = None
     last_line: int = None
     my_time_ms: float = None
-    seq: int = None
     sql: str = None
 
 
@@ -66,8 +66,7 @@ POISON_PILL = object()
 RE_HEADER = re.compile(r'^(?P<timestamp>.* CEST) \[\d+] (?P<process_start>[a-f0-9]+)\.(?P<process_id>[a-f0-9]+)')
 RE_QUERY = re.compile(r' [^ ]+ (?P<txid>[0-9]+) LOG:  duration: (?P<duration_ms>[0-9.]+) ms  statement: (?P<sql>.*)$')
 RE_EXCLUDE = re.compile(r'Connection reset by peer|archive-push|pushed WAL file|ERROR:|DETAIL:|STATEMENT:|^\t')
-EXECUTOR = ThreadPoolExecutor()
-PROGRESS_REPORT_QUEUE = Queue(maxsize=0)
+EXECUTOR = ThreadPoolExecutor(max_workers=200)
 
 
 @click.command()
@@ -76,6 +75,9 @@ PROGRESS_REPORT_QUEUE = Queue(maxsize=0)
 @click.option('--allow-unsorted-files')
 @click.argument('files', nargs=-1)
 def replay(time_factor, progress_db, allow_unsorted_files, files):
+    return _replay(time_factor, progress_db, allow_unsorted_files, files)
+
+def _replay(time_factor, progress_db, allow_unsorted_files, files):
     if list(sorted(files)) != list(files) and not allow_unsorted_files:
         click.echo(files)
         raise ValueError('The log files are not sorted. If you are sure the order is correct, '
@@ -89,48 +91,64 @@ def replay(time_factor, progress_db, allow_unsorted_files, files):
 
     queries = parse_files(files, last_pos)
     # Peek to find the time of the first query
-    first_query = next(queries)
-    click.echo(f'Starting at {first_query.file}:{first_query.line}')
-    queries = itertools.chain([first_query], queries)
+    try:
+        first_query = next(queries)
+        click.echo(f'Starting at {first_query.file}:{first_query.line}')
+        queries = itertools.chain([first_query], queries)
+    except StopIteration:
+        first_query = Query(files[0], 0, 0, 0, 0, 0, datetime.now(timezone.utc), None, 0)
 
     waiter = Waiter(time_factor, first_query.timestamp)
-    progress_reporter = ProgressReporter(progress_db)
+    progress_reporter_q = Queue()
+    progress_reporter = ProgressReporter(progress_db, progress_reporter_q)
     progress_reporter.start()
 
     # Simulate multiple workers querying the database. Each session (PostgreSQL process) is a single thread.
-    tasks = {}
+    transactions = {}
+    independent_query_queue = Queue(maxsize=80)
+    independent_query_executors = [
+            EXECUTOR.submit(session_task, independent_query_queue, progress_reporter_q, target_pool, waiter, 'X.X')
+            for _ in range(10)
+    ]
+    num_queries = 0
 
     for query in queries:
-        existing = tasks.get(query.process_id)
-
-        if existing and existing[2] != query.process_start:
-            existing[1].queue.put(POISON_PILL)
-            existing = None
-
+        num_queries += 1
+        existing = transactions.get(query.process_id)
         if existing:
-            task, queue, process_start = existing
-        else:
-            queue = Queue(maxsize=10)
+            existing[1].put(query)
+            if query.sql in ['COMMIT', 'ROLLBACK']:
+                existing[1].put(POISON_PILL)
+                existing[0].result()
+                del transactions[query.process_id]
+        elif query.sql == 'BEGIN':
+            queue = Queue()
             task = EXECUTOR.submit(
                 session_task,
                 queue,
-                PROGRESS_REPORT_QUEUE,
+                progress_reporter_q,
                 target_pool,
                 waiter,
                 f'{query.process_start:X}.{query.process_id:X}'.lower())
-            tasks[query.process_id] = (task, queue, query.process_start)
+            transactions[query.process_id] = (task, queue)
+        else:
+            independent_query_queue.put(query)
 
-        queue.put(query)
-
-    for task, queue, _ in tasks.values():
+    print('Waiting for queries to finish')
+    # Finish transactions
+    for task, queue in transactions.values():
         queue.put(POISON_PILL)
         task.result()
 
-    while not PROGRESS_REPORT_QUEUE.empty():
-        click.echo('Waiting to save progress messages...')
-        time.sleep(0.5)
+    independent_query_queue.join()
 
-    progress_reporter.setDaemon(True)
+    for i in range(len(independent_query_executors)):
+        independent_query_queue.put(POISON_PILL)
+
+    for task in independent_query_executors:
+        task.result()
+
+    progress_reporter_q.join()
 
 
 def parse_files(filenames, last_pos):
@@ -188,16 +206,17 @@ def parse_lines(filename, start_line) -> [Query]:
 
 
 class ProgressReporter(Thread):
-    def __init__(self, progress_dbname):
-        super().__init__(name='Progress')
+    def __init__(self, progress_dbname, queue):
+        super().__init__(name='Progress', daemon=True)
         self.progress_dbname = progress_dbname
+        self.queue = queue
 
     def run(self):
         current_filename = None
         current_file_id = None
         with sqlite3.connect(self.progress_dbname) as progress_db:
             while True:
-                q: Query = PROGRESS_REPORT_QUEUE.get()
+                q: Query = self.queue.get()
 
                 if q.file != current_filename:
                     if current_filename is not None:
@@ -217,46 +236,67 @@ class ProgressReporter(Thread):
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 ''', [q.txid, current_file_id, q.line, q.last_line, q.original_time_ms, q.my_time_ms, q.failure_msg])
                 progress_db.commit()
+                self.queue.task_done()
 
 
-def session_task(queue: Queue, progress_queue: Queue, target_pool, waiter, session_id):
-    print(f'Starting thread {session_id}')
+@contextlib.contextmanager
+def in_db(target_pool):
     try:
         target_db = target_pool.getconn()
     except DatabaseError:
         traceback.print_exc()
-        sys.exit(1)
-
+        raise
     try:
+        target_db.set_isolation_level(0)  # Explicit BEGIN needed for a transaction
+        yield target_db
+    except Exception:
+        traceback.print_exc()
+        raise
+    finally:
+        target_pool.putconn(target_db)
+
+
+def single_task(query, progress_queue, target_pool, waiter):
+    with in_db(target_pool) as target_db:
+        cursor = target_db.cursor()
+        execute_query(query, cursor, progress_queue, waiter)
+        cursor.close()
+
+
+def execute_query(query, cursor, progress_queue, waiter):
+    cursor.execute('SET statement_timeout = %s', (query.original_time_ms * 10 + 5,))
+    waiter.wait_for_query(query.timestamp)
+
+    start_time = time.monotonic()
+    try:
+        cursor.execute(query.sql)
+    except Exception as e:
+        query.failure_msg = str(e)
+        if False and not isinstance(e, (UniqueViolation, ForeignKeyViolation, InvalidCursorName)):
+            traceback.print_exc()
+            raise
+    finally:
+        end_time = time.monotonic()
+        query.my_time_ms = (end_time - start_time) * 1000
+        progress_queue.put(query)
+
+
+def session_task(queue: Queue, progress_queue: Queue, target_pool, waiter, session_id):
+    with in_db(target_pool) as target_db:
         cursor = target_db.cursor()
         while True:
             query: Query = queue.get()
-            if query is POISON_PILL:
-                click.echo(f'Finishing {session_id}')
-                cursor.close()
-                return
-
-            cursor.execute('SET statement_timeout = %s', (query.original_time_ms * 10 + 5,))
-            waiter.wait_for_query(query.timestamp)
-
-            start_time = time.monotonic()
             try:
-                cursor.execute(query.sql)
-            except Exception as e:
-                if not isinstance(e, (UniqueViolation, ForeignKeyViolation)):
-                    traceback.print_exc()
-                query.failure_msg = str(e)
-                target_db.rollback()
-            end_time = time.monotonic()
+                if query is POISON_PILL:
+                    cursor.close()
+                    return
 
-            query.my_time_ms = (end_time - start_time) * 1000
-            progress_queue.put(query)
-    except Exception:
-        traceback.print_exc()
-        sys.exit(1)
-    finally:
-        print('Finishing connection')
-        target_pool.putconn(target_db)
+                try:
+                    execute_query(query, cursor, progress_queue, waiter)
+                except Exception:
+                    cursor.execute('ROLLBACK')
+            finally:
+                queue.task_done()
 
 
 def prepare_local_db(progress_db):
