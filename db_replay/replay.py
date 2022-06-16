@@ -1,10 +1,8 @@
-import contextlib
 import dataclasses
 import io
 import itertools
 import re
 import sqlite3
-import sys
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -15,12 +13,16 @@ from threading import Thread
 import click
 import dateutil.parser
 import psycopg2.pool
-from psycopg2 import DatabaseError
 from psycopg2.errors import UniqueViolation, ForeignKeyViolation, InvalidCursorName
 
 
 @dataclasses.dataclass
 class Query:
+    """
+    A query from a log file. Later, it gets extra data such as `my_time_ms` meaning
+    how long it took to execute it against current database or optionally `failure_msg`
+    if the query failed for us.
+    """
     file: str
     line: int
     txid: int
@@ -75,7 +77,9 @@ EXECUTOR = ThreadPoolExecutor(max_workers=200)
 @click.option('--allow-unsorted-files')
 @click.argument('files', nargs=-1)
 def replay(time_factor, progress_db, allow_unsorted_files, files):
+    # One indirection for better debugging. Without it, py-bt in gdb didn't see line numbers.
     return _replay(time_factor, progress_db, allow_unsorted_files, files)
+
 
 def _replay(time_factor, progress_db, allow_unsorted_files, files):
     if list(sorted(files)) != list(files) and not allow_unsorted_files:
@@ -87,8 +91,10 @@ def _replay(time_factor, progress_db, allow_unsorted_files, files):
         prepare_local_db(db)
         last_pos = get_position(db)
 
+    # The database to which we'll send the queries from log files
     target_pool = psycopg2.pool.ThreadedConnectionPool(0, 200)
 
+    # The source of queries from log files. Skips already processed lines.
     queries = parse_files(files, last_pos)
     # Peek to find the time of the first query
     try:
@@ -96,59 +102,91 @@ def _replay(time_factor, progress_db, allow_unsorted_files, files):
         click.echo(f'Starting at {first_query.file}:{first_query.line}')
         queries = itertools.chain([first_query], queries)
     except StopIteration:
-        first_query = Query(files[0], 0, 0, 0, 0, 0, datetime.now(timezone.utc), None, 0)
+        # Special case - empty file or already processed. We could return here
+        # but we'll proceed to check that the concurrency logic works also with
+        # empty queues.
+        first_query = Query(files[0], 0, 0, 0, 0, 0, datetime.now(timezone.utc), '', 0)
 
+    # In order to simulate the original concurrency, we'll need to wait occasionally.
+    # `waiter` will pause the threads to not hammer the database too much. The `time_factor`
+    # can speed up or slow down the herd. Setting time_factor really high makes it go
+    # as fast as we can.
+    #
+    # The limit of the current program design seems to be at around 1000 queries per second.
     waiter = Waiter(time_factor, first_query.timestamp)
+
+    # There is a dedicated thread writing to SQLite database because it's not thread-safe
+    # to share the SQLite connection.
     progress_reporter_q = Queue()
     progress_reporter = ProgressReporter(progress_db, progress_reporter_q)
     progress_reporter.start()
 
-    # Simulate multiple workers querying the database. Each session (PostgreSQL process) is a single thread.
+    # There are two types of workers. `transactions` holds workers that simulate transactions
+    # Whenever a transaction is open with BEGIN, the following queries will go to the same
+    # worker.
     transactions = {}
+    # The other type of worker is the one that processes queries without a transaction. They
+    # share a queue and just execute the queries.
     independent_query_queue = Queue(maxsize=80)
     independent_query_executors = [
             EXECUTOR.submit(session_task, independent_query_queue, progress_reporter_q, target_pool, waiter, 'X.X')
-            for _ in range(10)
+            for _ in range(40)
     ]
-    num_queries = 0
 
-    for query in queries:
-        num_queries += 1
-        existing = transactions.get(query.process_id)
-        if existing:
-            existing[1].put(query)
-            if query.sql in ['COMMIT', 'ROLLBACK']:
-                existing[1].put(POISON_PILL)
-                existing[0].result()
-                del transactions[query.process_id]
-        elif query.sql == 'BEGIN':
-            queue = Queue()
-            task = EXECUTOR.submit(
-                session_task,
-                queue,
-                progress_reporter_q,
-                target_pool,
-                waiter,
-                f'{query.process_start:X}.{query.process_id:X}'.lower())
-            transactions[query.process_id] = (task, queue)
-        else:
-            independent_query_queue.put(query)
+    # An optimization - avoid waiting for transactional tasks when they're likely not finished yet.
+    # Instead, put them into a queue and wait when there are a few tasks in the queue.
+    finishing_tasks = Queue()
 
-    print('Waiting for queries to finish')
-    # Finish transactions
-    for task, queue in transactions.values():
-        queue.put(POISON_PILL)
-        task.result()
+    try:
+        for query in queries:
+            if query.process_id in transactions:
+                task, queue = transactions.get(query.process_id)
+                queue.put(query)
+                if query.sql in ['COMMIT', 'ROLLBACK']:
+                    queue.put(POISON_PILL)
+                    # This kind of task finishes when it depletes the queue.
+                    finishing_tasks.put(task)
+                    del transactions[query.process_id]
+            elif query.sql == 'BEGIN':
+                queue = Queue()
+                task = EXECUTOR.submit(
+                    session_task,
+                    queue,
+                    progress_reporter_q,
+                    target_pool,
+                    waiter,
+                    f'{query.process_start:X}.{query.process_id:X}'.lower())
+                transactions[query.process_id] = (task, queue)
+            else:
+                independent_query_queue.put(query)
 
-    independent_query_queue.join()
+            if finishing_tasks.qsize() > 100:
+                finishing_tasks.get().result()
+    finally:
+        print('Waiting for queries to finish')
+        # Wait for transaction tasks that we know should finish
+        while not finishing_tasks.empty():
+            finishing_tasks.get().result()
 
-    for i in range(len(independent_query_executors)):
-        independent_query_queue.put(POISON_PILL)
+        if transactions:
+            click.echo(f'There are {len(transactions)} unfinished transactions that will be rolled back.')
+        for task, queue in transactions.values():
+            queue.put(POISON_PILL)
+            task.result()
 
-    for task in independent_query_executors:
-        task.result()
+        # Wait until all the independent queries have been processed by the tasks.
+        independent_query_queue.join()
 
-    progress_reporter_q.join()
+        # Now, just send signal to the workers that we're done.
+        for i in range(len(independent_query_executors)):
+            independent_query_queue.put(POISON_PILL)
+
+        # And collect their exceptions if any.
+        for task in independent_query_executors:
+            task.result()
+
+        # Once nobody is sending queries, wait for all to be safely reported.
+        progress_reporter_q.join()
 
 
 def parse_files(filenames, last_pos):
@@ -239,30 +277,6 @@ class ProgressReporter(Thread):
                 self.queue.task_done()
 
 
-@contextlib.contextmanager
-def in_db(target_pool):
-    try:
-        target_db = target_pool.getconn()
-    except DatabaseError:
-        traceback.print_exc()
-        raise
-    try:
-        target_db.set_isolation_level(0)  # Explicit BEGIN needed for a transaction
-        yield target_db
-    except Exception:
-        traceback.print_exc()
-        raise
-    finally:
-        target_pool.putconn(target_db)
-
-
-def single_task(query, progress_queue, target_pool, waiter):
-    with in_db(target_pool) as target_db:
-        cursor = target_db.cursor()
-        execute_query(query, cursor, progress_queue, waiter)
-        cursor.close()
-
-
 def execute_query(query, cursor, progress_queue, waiter):
     cursor.execute('SET statement_timeout = %s', (query.original_time_ms * 10 + 5,))
     waiter.wait_for_query(query.timestamp)
@@ -282,7 +296,9 @@ def execute_query(query, cursor, progress_queue, waiter):
 
 
 def session_task(queue: Queue, progress_queue: Queue, target_pool, waiter, session_id):
-    with in_db(target_pool) as target_db:
+    target_db = target_pool.getconn()
+    try:
+        target_db.set_isolation_level(0)  # Explicit BEGIN needed for a transaction
         cursor = target_db.cursor()
         while True:
             query: Query = queue.get()
@@ -297,6 +313,8 @@ def session_task(queue: Queue, progress_queue: Queue, target_pool, waiter, sessi
                     cursor.execute('ROLLBACK')
             finally:
                 queue.task_done()
+    finally:
+        target_pool.putconn(target_db)
 
 
 def prepare_local_db(progress_db):
