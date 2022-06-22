@@ -42,6 +42,7 @@ class Waiter:
         self.time_factor = time_factor
         self.real_start_time = datetime.now(timezone.utc)
         self.last_reported = self.real_start_time
+        self.last_reported_wait = self.real_start_time
         self.counter = 0
 
     def wait_for_query(self, query_time: datetime):
@@ -59,7 +60,8 @@ class Waiter:
 
         sleep_duration = wanted_offset_s - real_offset_s
         if sleep_duration > 0:
-            if sleep_duration > 0.5:
+            if sleep_duration > 0.5 and now - self.last_reported_wait > timedelta(seconds=2):
+                self.last_reported_wait = now
                 click.echo(f'Waiting for {sleep_duration:4.1f}s')
             time.sleep(sleep_duration)
 
@@ -92,7 +94,7 @@ def _replay(time_factor, progress_db, allow_unsorted_files, files):
         last_pos = get_position(db)
 
     # The database to which we'll send the queries from log files
-    target_pool = psycopg2.pool.ThreadedConnectionPool(0, 200)
+    target_pool = psycopg2.pool.ThreadedConnectionPool(0, 200, fallback_application_name='db-replay')
 
     # The source of queries from log files. Skips already processed lines.
     queries = parse_files(files, last_pos)
