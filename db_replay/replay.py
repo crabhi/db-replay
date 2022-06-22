@@ -235,8 +235,8 @@ def parse_lines(filename, start_line) -> [Query]:
                         buffer.write(query_match.group('sql'))
                         continue
             elif buffer:
-                buffer.write("' || E'\\n' || '")
-                buffer.write(line[1:-1])
+                assert line[0] == "\t"
+                buffer.write(line[1:])
                 continue
 
             if not RE_EXCLUDE.search(line):
