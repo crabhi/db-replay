@@ -1,6 +1,7 @@
 import dataclasses
 import io
 import itertools
+import math
 import re
 import sqlite3
 import time
@@ -318,8 +319,13 @@ class ProgressReporter(Thread):
 
 
 def execute_query(query: Query, cursor, progress_queue, waiter):
-    cursor.execute('SET statement_timeout = %s', (query.original_time_ms * 10 + 5,))
-    cursor.execute('SET lock_timeout = %s', (query.original_time_ms * 10 - 5,))
+    x = query.original_time_ms
+    # Give more generous relative timeout for short queries. Gives 25ms for 0.01ms queries up to 20s for 10s queries
+    # 150s for 100s query and so on.
+    timeout = (x + 1)*(25/(3*math.log10(x+1)+1))
+
+    cursor.execute('SET statement_timeout = %s', (timeout,))
+    cursor.execute('SET lock_timeout = %s', (timeout - 5,))
     waiter.wait_for_query(query.timestamp)
 
     start_time = time.monotonic()
