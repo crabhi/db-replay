@@ -12,6 +12,8 @@ from terminaltables import SingleTable
 
 
 class QueryInteraction:
+    class SysExit: pass
+
     def __init__(self, conn, query, waiting_queries_count: Callable):
         self.waiting_queries = waiting_queries_count
         self.conn = conn
@@ -36,7 +38,7 @@ class QueryInteraction:
                     if command:
                         command(*reply[1:])
             except KeyboardInterrupt:
-                continue
+                return self.SysExit
             except EOFError:
                 break
             except (DatabaseError, TypeError) as e:
@@ -117,10 +119,13 @@ class QueryInteraction:
         with self.conn.cursor() as c:
             c.execute('SELECT pid, wait_event, query FROM pg_stat_activity')
             self.queries_snap = {row[0]: row[1:] for row in c}
-            print(self.queries_snap)
 
     def command_ex(self):
         with self.conn.cursor() as c:
             c.execute('EXPLAIN ' + self.query.sql)
             for row, in c:
                 print(row)
+
+    def command_i(self):
+        self.ignored_exceptions.append(type(self.query.failure))
+        pf(HTML('Will ignore <b>{}</b>').format(type(self.query.failure)))

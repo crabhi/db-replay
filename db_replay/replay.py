@@ -146,6 +146,9 @@ def _replay(time_factor, progress_db, allow_unsorted_files, files):
 
     try:
         for query in queries:
+            if progress_reporter.finish:
+                break
+
             if query.process_id in transactions:
                 task, queue = transactions.get(query.process_id)
                 queue.put(query)
@@ -257,6 +260,7 @@ class ProgressReporter(Thread):
         self.queue = queue
         self.target_pool = target_pool
         self.ignored_exceptions = {UniqueViolation, ForeignKeyViolation, InvalidCursorName}
+        self.finish = False
 
     def run(self):
         current_filename = None
@@ -287,7 +291,7 @@ class ProgressReporter(Thread):
                 self.queue.task_done()
 
     def should_interact(self, query: Query):
-        if NON_INTERACTIVE:
+        if NON_INTERACTIVE or self.finish:
             return False
         return query.failure and type(query.failure) not in self.ignored_exceptions
 
@@ -298,11 +302,12 @@ class ProgressReporter(Thread):
         conn = self.target_pool.getconn()
         try:
             qi = QueryInteraction(conn, query, lambda: sum(1 for q in self.queue.queue if self.should_interact(q)))
-            qi.interact()
+            if qi.interact() == QueryInteraction.SysExit:
+                self.finish = True
         finally:
             self.target_pool.putconn(conn)
 
-        self.ignored_exceptions.add(qi.ignored_exceptions)
+        self.ignored_exceptions.update(qi.ignored_exceptions)
 
 
 def execute_query(query: Query, cursor, progress_queue, waiter):
