@@ -3,6 +3,7 @@ import io
 import itertools
 import re
 import sqlite3
+import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +15,8 @@ import click
 import dateutil.parser
 import psycopg2.pool
 from psycopg2.errors import UniqueViolation, ForeignKeyViolation, InvalidCursorName
+
+from db_replay.interaction import QueryInteraction
 
 
 @dataclasses.dataclass
@@ -30,7 +33,7 @@ class Query:
     original_time_ms: float
     process_start: float
     timestamp: datetime
-    failure_msg: str = None
+    failure: Exception =  None
     last_line: int = None
     my_time_ms: float = None
     sql: str = None
@@ -119,8 +122,8 @@ def _replay(time_factor, progress_db, allow_unsorted_files, files):
 
     # There is a dedicated thread writing to SQLite database because it's not thread-safe
     # to share the SQLite connection.
-    progress_reporter_q = Queue()
-    progress_reporter = ProgressReporter(progress_db, progress_reporter_q)
+    progress_reporter_q = Queue(maxsize=10)
+    progress_reporter = ProgressReporter(progress_db, progress_reporter_q, target_pool)
     progress_reporter.start()
 
     # There are two types of workers. `transactions` holds workers that simulate transactions
@@ -246,10 +249,12 @@ def parse_lines(filename, start_line) -> [Query]:
 
 
 class ProgressReporter(Thread):
-    def __init__(self, progress_dbname, queue):
+    def __init__(self, progress_dbname, queue: Queue, target_pool):
         super().__init__(name='Progress', daemon=True)
         self.progress_dbname = progress_dbname
         self.queue = queue
+        self.target_pool = target_pool
+        self.ignored_exceptions = {UniqueViolation, ForeignKeyViolation, InvalidCursorName}
 
     def run(self):
         current_filename = None
@@ -257,6 +262,7 @@ class ProgressReporter(Thread):
         with sqlite3.connect(self.progress_dbname) as progress_db:
             while True:
                 q: Query = self.queue.get()
+                self.handle_interaction(q)
 
                 if q.file != current_filename:
                     if current_filename is not None:
@@ -274,23 +280,37 @@ class ProgressReporter(Thread):
                 progress_db.execute('''
                 INSERT INTO queries (txid, file, line_from, line_to, original_time_ms, my_time_ms, failure_message)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', [q.txid, current_file_id, q.line, q.last_line, q.original_time_ms, q.my_time_ms, q.failure_msg])
+                ''', [q.txid, current_file_id, q.line, q.last_line, q.original_time_ms, q.my_time_ms, str(q.failure)])
                 progress_db.commit()
                 self.queue.task_done()
 
+    def should_interact(self, query: Query):
+        return query.failure and type(query.failure) not in self.ignored_exceptions
 
-def execute_query(query, cursor, progress_queue, waiter):
+    def handle_interaction(self, query):
+        if not self.should_interact(query):
+            return
+
+        conn = self.target_pool.getconn()
+        try:
+            qi = QueryInteraction(conn, query, lambda: sum(1 for q in self.queue.queue if self.should_interact(q)))
+            qi.interact()
+        finally:
+            self.target_pool.putconn(conn)
+
+        self.ignored_exceptions.add(qi.ignored_exceptions)
+
+
+def execute_query(query: Query, cursor, progress_queue, waiter):
     cursor.execute('SET statement_timeout = %s', (query.original_time_ms * 10 + 5,))
+    cursor.execute('SET lock_timeout = %s', (query.original_time_ms * 10 - 5,))
     waiter.wait_for_query(query.timestamp)
 
     start_time = time.monotonic()
     try:
         cursor.execute(query.sql)
     except Exception as e:
-        query.failure_msg = str(e)
-        if False and not isinstance(e, (UniqueViolation, ForeignKeyViolation, InvalidCursorName)):
-            traceback.print_exc()
-            raise
+        query.failure = e
     finally:
         end_time = time.monotonic()
         query.my_time_ms = (end_time - start_time) * 1000

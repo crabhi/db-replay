@@ -5,10 +5,13 @@ description = ""
 authors = ["Filip Sedlák <filip@sedlakovi.org>"]
 
 [tool.poetry.dependencies]
-python = "^3.9"
+python = ">=3.9,<4"
 click = "^8.1.2"
 python-dateutil = "^2.8.2"
 psycopg2-binary = "^2.9.3"
+prompt-toolkit = "^3.0.29"
+sqlparse = "^0.4.2"
+terminaltables = "^3.1.10"
 
 [tool.poetry.dev-dependencies]
 pytest = "^7.1"
