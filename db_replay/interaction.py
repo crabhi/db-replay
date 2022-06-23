@@ -1,3 +1,4 @@
+import dataclasses
 import textwrap
 import traceback
 from typing import Callable
@@ -11,26 +12,33 @@ from psycopg2.extensions import TRANSACTION_STATUS_IDLE
 from terminaltables import SingleTable
 
 
+@dataclasses.dataclass
+class ActiveQuery:
+    wait_event: str
+    query: str
+
+
 class QueryInteraction:
     class SysExit: pass
 
-    def __init__(self, conn, query, waiting_queries_count: Callable):
+    def __init__(self, conn, query, waiting_queries_count: Callable, queries_snap=None):
         self.waiting_queries = waiting_queries_count
         self.conn = conn
         self.query = query
         self.ignored_exceptions = []
-        self.queries_snap = {}
+        self.queries_snap = queries_snap if queries_snap else {}
         self.session = PromptSession(bottom_toolbar=self._bottom_toolbar)
 
     def interact(self):
         self.command_e()
         self.command_q()
-        self.command_l()
+        self.show_locks()
 
         while True:
             try:
                 reply = self.session.prompt(
-                    '\n(l)ocks (sq <PID>) - snapshot query (q [PID]) query (e)xception (ex)plain\n> ',
+                    '\n(l)ocks (sq <PID>) - snapshot query (q [PID={pid}]) query (e)xception (ex)plain (i)gnore\n> '
+                    .format(pid=self.query.my_process_id),
                     completer=self._get_completer(),
                 ).split()
                 if reply:

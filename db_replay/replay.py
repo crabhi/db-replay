@@ -14,7 +14,7 @@ import dateutil.parser
 import psycopg2.pool
 from psycopg2.errors import UniqueViolation, ForeignKeyViolation, InvalidCursorName
 
-from db_replay.interaction import QueryInteraction
+from db_replay.interaction import QueryInteraction, ActiveQuery
 
 
 @dataclasses.dataclass
@@ -35,6 +35,7 @@ class Query:
     last_line: int = None
     my_time_ms: float = None
     sql: str = None
+    my_process_id: int = None
 
 
 class Waiter:
@@ -261,13 +262,17 @@ class ProgressReporter(Thread):
         self.target_pool = target_pool
         self.ignored_exceptions = {UniqueViolation, ForeignKeyViolation, InvalidCursorName}
         self.finish = False
+        self.query_cache = {}
 
     def run(self):
         current_filename = None
         current_file_id = None
+
+
         with sqlite3.connect(self.progress_dbname) as progress_db:
             while True:
                 q: Query = self.queue.get()
+                self.query_cache[q.my_process_id] = ActiveQuery(wait_event='?', query=q.sql)
                 self.handle_interaction(q)
 
                 if q.file != current_filename:
@@ -301,7 +306,9 @@ class ProgressReporter(Thread):
 
         conn = self.target_pool.getconn()
         try:
-            qi = QueryInteraction(conn, query, lambda: sum(1 for q in self.queue.queue if self.should_interact(q)))
+            qi = QueryInteraction(conn, query,
+                                  lambda: sum(1 for q in self.queue.queue if self.should_interact(q)),
+                                  self.query_cache)
             if qi.interact() == QueryInteraction.SysExit:
                 self.finish = True
         finally:
@@ -331,13 +338,15 @@ def session_task(queue: Queue, progress_queue: Queue, target_pool, waiter, sessi
     try:
         target_db.set_isolation_level(0)  # Explicit BEGIN needed for a transaction
         cursor = target_db.cursor()
+        cursor.execute('SELECT pg_backend_pid()')
+        my_pid, = cursor.fetchone()
         while True:
             query: Query = queue.get()
             try:
                 if query is POISON_PILL:
                     cursor.close()
                     return
-
+                query.my_process_id = my_pid
                 try:
                     execute_query(query, cursor, progress_queue, waiter)
                 except Exception:
