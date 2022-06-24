@@ -33,7 +33,7 @@ class Query:
     original_time_ms: float
     process_start: float
     timestamp: datetime
-    failure: Exception =  None
+    failure: Exception = None
     last_line: int = None
     my_time_ms: float = None
     sql: str = None
@@ -75,7 +75,7 @@ RE_HEADER = re.compile(r'^(?P<timestamp>.* CEST) \[\d+] (?P<process_start>[a-f0-
 RE_QUERY = re.compile(r' [^ ]+ (?P<txid>[0-9]+) LOG:  duration: (?P<duration_ms>[0-9.]+) ms  statement: (?P<sql>.*)$')
 RE_EXCLUDE = re.compile(r'Connection reset by peer|archive-push|pushed WAL file|ERROR:|DETAIL:|STATEMENT:|^\t')
 EXECUTOR = ThreadPoolExecutor(max_workers=200)
-NON_INTERACTIVE = False
+INTERACTIVE = False
 EXTRA_TIMEOUT_MS = PolyLine([
     (0, 30),
     (1, 35),  # For queries that took 1 ms in production, wait extra 35 ms before canceling.
@@ -91,11 +91,11 @@ EXTRA_TIMEOUT_MS = PolyLine([
 @click.option('--time-factor', default=1.0, help='Run faster or slower than production')
 @click.option('--progress-db', default='replay.sqlite', help='Where to store progress data')
 @click.option('--allow-unsorted-files')
-@click.option('--noninteractive')
+@click.option('--interactive/--no-interactive')
 @click.argument('files', nargs=-1)
-def replay(time_factor, progress_db, allow_unsorted_files, noninteractive, files):
-    global NON_INTERACTIVE
-    NON_INTERACTIVE = noninteractive
+def replay(time_factor, progress_db, allow_unsorted_files, interactive, files):
+    global INTERACTIVE
+    INTERACTIVE = interactive
     # One indirection for better debugging. Without it, py-bt in gdb didn't see line numbers.
     return _replay(time_factor, progress_db, allow_unsorted_files, files)
 
@@ -124,7 +124,7 @@ def _replay(time_factor, progress_db, allow_unsorted_files, files):
         # Special case - empty file or already processed. We could return here
         # but we'll proceed to check that the concurrency logic works also with
         # empty queues.
-        first_query = Query(files[0], 0, 0, 0, 0, 0, datetime.now(timezone.utc), '', 0)
+        first_query = Query(files[0], 0, 0, 0, 0, 0, datetime.now(timezone.utc))
 
     # In order to simulate the original concurrency, we'll need to wait occasionally.
     # `waiter` will pause the threads to not hammer the database too much. The `time_factor`
@@ -307,7 +307,7 @@ class ProgressReporter(Thread):
                 self.queue.task_done()
 
     def should_interact(self, query: Query):
-        if NON_INTERACTIVE or self.finish:
+        if not INTERACTIVE or self.finish:
             return False
         return query.failure and type(query.failure) not in self.ignored_exceptions
 
