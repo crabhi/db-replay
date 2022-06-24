@@ -16,6 +16,7 @@ import psycopg2.pool
 from psycopg2.errors import UniqueViolation, ForeignKeyViolation, InvalidCursorName
 
 from db_replay.interaction import QueryInteraction, ActiveQuery
+from db_replay.interpolation import PolyLine
 
 
 @dataclasses.dataclass
@@ -75,6 +76,15 @@ RE_QUERY = re.compile(r' [^ ]+ (?P<txid>[0-9]+) LOG:  duration: (?P<duration_ms>
 RE_EXCLUDE = re.compile(r'Connection reset by peer|archive-push|pushed WAL file|ERROR:|DETAIL:|STATEMENT:|^\t')
 EXECUTOR = ThreadPoolExecutor(max_workers=200)
 NON_INTERACTIVE = False
+EXTRA_TIMEOUT_MS = PolyLine([
+    (0, 30),
+    (1, 35),  # For queries that took 1 ms in production, wait extra 35 ms before canceling.
+    (5, 40),
+    (100, 100),
+    (1_000, 800),
+    (10_000, 5000),
+    (100_000, 20_000),  # The last value is the extra timeout for the longest queries.
+])
 
 
 @click.command()
@@ -319,10 +329,7 @@ class ProgressReporter(Thread):
 
 
 def execute_query(query: Query, cursor, progress_queue, waiter):
-    x = query.original_time_ms
-    # Give more generous relative timeout for short queries. Gives 25ms for 0.01ms queries up to 20s for 10s queries
-    # 150s for 100s query and so on.
-    timeout = (x + 1)*(25/(3*math.log10(x+1)+1))
+    timeout = query.original_time_ms + EXTRA_TIMEOUT_MS.evaluate(query.original_time_ms)
 
     cursor.execute('SET statement_timeout = %s', (timeout,))
     cursor.execute('SET lock_timeout = %s', (timeout - 5,))
