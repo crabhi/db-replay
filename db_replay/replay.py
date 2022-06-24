@@ -13,7 +13,7 @@ from threading import Thread
 import click
 import dateutil.parser
 import psycopg2.pool
-from psycopg2.errors import UniqueViolation, ForeignKeyViolation, InvalidCursorName
+from psycopg2.errors import UniqueViolation, ForeignKeyViolation, InvalidCursorName, NoActiveSqlTransaction
 
 from db_replay.interaction import QueryInteraction, ActiveQuery
 from db_replay.interpolation import PolyLine
@@ -271,7 +271,7 @@ class ProgressReporter(Thread):
         self.progress_dbname = progress_dbname
         self.queue = queue
         self.target_pool = target_pool
-        self.ignored_exceptions = {UniqueViolation, ForeignKeyViolation, InvalidCursorName}
+        self.ignored_exceptions = {UniqueViolation, ForeignKeyViolation, InvalidCursorName, NoActiveSqlTransaction}
         self.finish = False
         self.query_cache = {}
 
