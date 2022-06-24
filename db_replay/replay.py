@@ -96,6 +96,8 @@ EXTRA_TIMEOUT_MS = PolyLine([
 def replay(time_factor, progress_db, allow_unsorted_files, interactive, files):
     global INTERACTIVE
     INTERACTIVE = interactive
+    if not files:
+        return
     # One indirection for better debugging. Without it, py-bt in gdb didn't see line numbers.
     return _replay(time_factor, progress_db, allow_unsorted_files, files)
 
