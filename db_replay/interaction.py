@@ -119,14 +119,14 @@ class QueryInteraction:
     def command_sq(self, pid):
         data = self.queries_snap.get(int(pid))
         if data:
-            pf(HTML('<b>{}</b> {}').format(*data))
+            pf(HTML('<b>{q.wait_event}</b> {q.query}').format(q=data))
         else:
             pf(HTML('No query for PID {}').format(pid))
 
     def snapshot_queries(self):
         with self.conn.cursor() as c:
             c.execute('SELECT pid, wait_event, query FROM pg_stat_activity')
-            self.queries_snap = {row[0]: row[1:] for row in c}
+            self.queries_snap = {row[0]: ActiveQuery(query=row[2], wait_event=row[1]) for row in c}
 
     def command_ex(self):
         with self.conn.cursor() as c:
